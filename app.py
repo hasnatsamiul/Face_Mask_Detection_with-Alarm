@@ -1,35 +1,48 @@
 import streamlit as st
-import numpy as np
 import cv2
+import numpy as np
 import time
-import tempfile
 from pathlib import Path
 from base64 import b64encode
 
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from tensorflow.keras.preprocessing.image import img_to_array
 
-st.set_page_config(page_title="Face Mask Detector", page_icon="😷", layout="centered")
-st.title("😷 Face Mask Detection")
+# --------------------------------------------------
+# Page config
+# --------------------------------------------------
+st.set_page_config(
+    page_title="Face Mask Detection (Live)",
+    page_icon="😷",
+    layout="centered"
+)
+st.title("😷 Live Face Mask Detection (WebRTC)")
 
-# ---------- Load models once (cached) ----------
+# --------------------------------------------------
+# Load models (cached)
+# --------------------------------------------------
 @st.cache_resource
 def load_models():
-    face_proto = Path("face_detector") / "deploy.prototxt"
-    face_model = Path("face_detector") / "res10_300x300_ssd_iter_140000.caffemodel"
-    if not face_proto.exists() or not face_model.exists():
-        raise FileNotFoundError(
-            "Face detector files not found. Need 'face_detector/deploy.prototxt' "
-            "and 'face_detector/res10_300x300_ssd_iter_140000.caffemodel'."
-        )
-    net = cv2.dnn.readNetFromCaffe(str(face_proto), str(face_model))
+    face_proto = Path("face_detector/deploy.prototxt")
+    face_model = Path("face_detector/res10_300x300_ssd_iter_140000.caffemodel")
 
-    mask_model_path = Path("mask_detector.model")
-    if not mask_model_path.exists():
-        raise FileNotFoundError("Mask model not found. Place 'mask_detector.model' at repo root.")
-    clf = load_model(str(mask_model_path))
+    if not face_proto.exists() or not face_model.exists():
+        raise FileNotFoundError("Face detector files missing")
+
+    net = cv2.dnn.readNetFromCaffe(
+        str(face_proto),
+        str(face_model)
+    )
+
+    mask_model = Path("mask_detector.model")
+    if not mask_model.exists():
+        raise FileNotFoundError("mask_detector.model not found")
+
+    clf = load_model(str(mask_model))
     return net, clf
+
 
 @st.cache_resource
 def load_alarm():
@@ -39,209 +52,176 @@ def load_alarm():
     data = p.read_bytes()
     return data, b64encode(data).decode()
 
-try:
-    net, clf = load_models()
-except Exception as e:
-    st.error(f"Model load error: {e}")
-    st.stop()
 
+net, clf = load_models()
 alarm_bytes, alarm_b64 = load_alarm()
 
-# ---------- Inference ----------
-def detect_and_annotate(bgr_img: np.ndarray, conf_thresh: float = 0.5):
-    """Detect faces and classify mask vs no-mask; draw boxes; return flags for alarm."""
-    h, w = bgr_img.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(bgr_img, (300, 300)), 1.0, (300, 300),
-                                 (104.0, 177.0, 123.0))
-    net.setInput(blob)
-    dets = net.forward()
+# --------------------------------------------------
+# Session state
+# --------------------------------------------------
+if "alarm_flag" not in st.session_state:
+    st.session_state.alarm_flag = False
 
-    count = 0
+if "last_alarm" not in st.session_state:
+    st.session_state.last_alarm = 0.0
+
+# --------------------------------------------------
+# Detection function
+# --------------------------------------------------
+def detect_and_annotate(frame, conf_thresh):
+    h, w = frame.shape[:2]
+
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(frame, (300, 300)),
+        1.0,
+        (300, 300),
+        (104.0, 177.0, 123.0),
+    )
+    net.setInput(blob)
+    detections = net.forward()
+
     has_mask = False
     has_no_mask = False
 
-    for i in range(dets.shape[2]):
-        confidence = dets[0, 0, i, 2]
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
         if confidence < conf_thresh:
             continue
 
-        box = dets[0, 0, i, 3:7] * np.array([w, h, w, h])
-        (x1, y1, x2, y2) = box.astype("int")
+        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+        x1, y1, x2, y2 = box.astype("int")
+
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w - 1, x2), min(h - 1, y2)
 
-        face = bgr_img[y1:y2, x1:x2]
+        face = frame[y1:y2, x1:x2]
         if face.size == 0:
             continue
 
         face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
         face_rgb = cv2.resize(face_rgb, (224, 224))
+
         arr = img_to_array(face_rgb)
         arr = preprocess_input(arr)
         arr = np.expand_dims(arr, axis=0)
 
-        (mask, no_mask) = clf.predict(arr, verbose=0)[0]
+        mask, no_mask = clf.predict(arr, verbose=0)[0]
         label = "Mask" if mask > no_mask else "No Mask"
-        score = float(max(mask, no_mask))
-        color = (0, 200, 0) if label == "Mask" else (0, 0, 200)
+        color = (0, 200, 0) if label == "Mask" else (0, 0, 255)
 
         if label == "Mask":
             has_mask = True
         else:
             has_no_mask = True
 
-        cv2.rectangle(bgr_img, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(bgr_img, f"{label}: {score:.2f}", (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        count += 1
-
-    return bgr_img, count, has_mask, has_no_mask
-
-# ---------- Alarm helpers ----------
-if "last_alarm" not in st.session_state:
-    st.session_state.last_alarm = 0.0
-
-def maybe_play_alarm(has_mask: bool, has_no_mask: bool, cooldown_s: float):
-    """Play alarm if trigger condition met; throttle by cooldown."""
-    if not alarm_enabled or alarm_bytes is None:
-        return
-    should_alarm = (alarm_trigger == "No Mask" and has_no_mask) or (alarm_trigger == "Mask" and has_mask)
-    now = time.time()
-    if should_alarm and (now - st.session_state.last_alarm) > cooldown_s:
-        st.warning("🚨 Alarm triggered")
-        st.audio(alarm_bytes, format="audio/mp3")  # always works after any user interaction
-        # (Optional) best-effort autoplay:
-        st.markdown(
-            f"""<audio autoplay><source src="data:audio/mp3;base64,{alarm_b64}" type="audio/mpeg"></audio>""",
-            unsafe_allow_html=True,
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            f"{label}",
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
         )
-        st.session_state.last_alarm = now
 
-# ---------- UI ----------
+    return frame, has_mask, has_no_mask
+
+
+# --------------------------------------------------
+# Sidebar controls
+# --------------------------------------------------
 st.sidebar.header("Settings")
-conf_thresh = st.sidebar.slider("Face detection confidence", 0.1, 0.9, 0.5, 0.05)
 
-alarm_enabled = st.sidebar.toggle("Enable alarm sound", value=True)
-alarm_trigger = st.sidebar.selectbox("Alarm when …", ["No Mask", "Mask"])
-cooldown_s = st.sidebar.slider("Alarm cooldown (seconds)", 0.0, 10.0, 3.0, 0.5)
-if alarm_enabled and alarm_bytes is None:
-    st.sidebar.warning("alert.mp3 not found at repo root — sound will be disabled.")
-
-mode = st.radio("Choose input", ["Upload Image", "Webcam (snapshot)", "Video (local camera)", "Video file"])
-
-# ---------- Upload Image ----------
-if mode == "Upload Image":
-    up = st.file_uploader("Upload a JPG/PNG", type=["jpg", "jpeg", "png"])
-    if up:
-        data = np.frombuffer(up.read(), np.uint8)
-        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if bgr is None:
-            st.error("Could not read image.")
-        else:
-            out, n, has_mask, has_no_mask = detect_and_annotate(bgr.copy(), conf_thresh)
-            st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
-            st.caption(f"Faces processed: {n}")
-            maybe_play_alarm(has_mask, has_no_mask, cooldown_s)
-
-# ---------- Webcam (snapshot) ----------
-elif mode == "Webcam (snapshot)":
-    st.info("Click below and allow camera access in your browser, then take a snapshot.")
-    cam = st.camera_input("Live camera")
-    if cam is not None:
-        data = np.frombuffer(cam.getvalue(), np.uint8)
-        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if bgr is None:
-            st.error("Could not read camera frame.")
-        else:
-            out, n, has_mask, has_no_mask = detect_and_annotate(bgr.copy(), conf_thresh)
-            st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
-            st.caption(f"Faces processed: {n}")
-            maybe_play_alarm(has_mask, has_no_mask, cooldown_s)
-
-# ---------- Video (local camera) ----------
-elif mode == "Video (local camera)":
-    st.info("Uses your machine's webcam via OpenCV. Not available on Streamlit Cloud.")
-    cam_index = st.sidebar.number_input("Camera index", min_value=0, max_value=5, value=0, step=1)
-    width = st.sidebar.slider("Frame width", 320, 1280, 640, 80)
-    fps_limit = st.sidebar.slider("Max FPS (approx)", 1, 30, 10, 1)
-
-    run = st.toggle("Start / Stop", value=False, key="run_local")
-    stframe = st.empty()
-
-    if run:
-        cap = cv2.VideoCapture(int(cam_index))
-        if not cap.isOpened():
-            st.error("Could not open local camera. Try a different index or run locally.")
-        else:
-            last = 0.0
-            try:
-                while st.session_state.run_local:
-                    ret, frame = cap.read()
-                    if not ret:
-                        st.warning("No frame read from camera.")
-                        break
-                    if width:
-                        frame = cv2.resize(frame, (width, int(width * frame.shape[0] / frame.shape[1])))
-
-                    out, n, has_mask, has_no_mask = detect_and_annotate(frame, conf_thresh)
-                    stframe.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
-                    maybe_play_alarm(has_mask, has_no_mask, cooldown_s)
-
-                    # crude FPS limit
-                    dt = time.time() - last
-                    sleep_for = max(0.0, (1.0 / fps_limit) - dt)
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                    last = time.time()
-            finally:
-                cap.release()
-
-# ---------- Video file ----------
-else:
-    st.info("Upload a video to run continuous detection in the browser.")
-    vf = st.file_uploader("Upload a video", type=["mp4", "mov", "avi", "mkv"])
-    show_preview = st.checkbox("Show preview while processing", value=True)
-    max_frames = st.sidebar.slider("Max frames (0 = all)", 0, 3000, 0, 100)
-    if vf:
-        # Save to temp file for OpenCV
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(vf.read())
-        tfile.flush()
-
-        cap = cv2.VideoCapture(tfile.name)
-        stframe = st.empty()
-        frames_done = 0
-
-        if not cap.isOpened():
-            st.error("Could not open uploaded video.")
-        else:
-            try:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    out, n, has_mask, has_no_mask = detect_and_annotate(frame, conf_thresh)
-                    if show_preview:
-                        stframe.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
-                    maybe_play_alarm(has_mask, has_no_mask, cooldown_s)
-
-                    frames_done += 1
-                    if max_frames and frames_done >= max_frames:
-                        break
-            finally:
-                cap.release()
-        st.success(f"Processed {frames_done} frames.")
-
-
-    # ---------- Footer ----------
-st.markdown(
-    """
-    <hr style="margin-top: 50px; margin-bottom: 10px;">
-    <div style="text-align: center; font-size: 14px; color: gray;">
-        Developed by <b>Hasnat Samiul</b> ✌🏼 | Contact: 
-        <a href="mailto:smhasnats@gmail.com" style="color: gray;">smhasnats@gmail.com</a>
-    </div>
-    """,
-    unsafe_allow_html=True
+conf_thresh = st.sidebar.slider(
+    "Face detection confidence",
+    0.1, 0.9, 0.5, 0.05
 )
 
+alarm_enabled = st.sidebar.toggle("Enable alarm", value=True)
+alarm_trigger = st.sidebar.selectbox(
+    "Alarm when",
+    ["No Mask", "Mask"]
+)
+cooldown = st.sidebar.slider(
+    "Alarm cooldown (seconds)",
+    0.0, 10.0, 3.0, 0.5
+)
+
+if alarm_enabled and alarm_bytes is None:
+    st.sidebar.warning("alert.mp3 not found")
+
+# --------------------------------------------------
+# WebRTC Video Processor
+# --------------------------------------------------
+class MaskProcessor(VideoProcessorBase):
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+
+        out, has_mask, has_no_mask = detect_and_annotate(
+            img,
+            conf_thresh
+        )
+
+        trigger = (
+            (alarm_trigger == "No Mask" and has_no_mask) or
+            (alarm_trigger == "Mask" and has_mask)
+        )
+
+        if trigger:
+            st.session_state.alarm_flag = True
+
+        return out
+
+
+# --------------------------------------------------
+# Start WebRTC
+# --------------------------------------------------
+webrtc_streamer(
+    key="mask-detection",
+    video_processor_factory=MaskProcessor,
+    media_stream_constraints={
+        "video": True,
+        "audio": False
+    },
+    async_processing=True,
+)
+
+# --------------------------------------------------
+# Alarm playback (MAIN THREAD ONLY)
+# --------------------------------------------------
+now = time.time()
+if (
+    alarm_enabled
+    and st.session_state.alarm_flag
+    and alarm_bytes is not None
+    and (now - st.session_state.last_alarm) > cooldown
+):
+    st.warning("🚨 Alarm triggered!")
+    st.audio(alarm_bytes, format="audio/mp3")
+
+    st.markdown(
+        f"""
+        <audio autoplay>
+            <source src="data:audio/mp3;base64,{alarm_b64}">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.session_state.last_alarm = now
+    st.session_state.alarm_flag = False
+
+# --------------------------------------------------
+# Footer
+# --------------------------------------------------
+st.markdown(
+    """
+    <hr>
+    <div style="text-align:center; font-size:14px; color:gray;">
+        Developed by <b>Hasnat Samiul</b> ✌🏼<br>
+        <a href="mailto:smhasnats@gmail.com">smhasnats@gmail.com</a>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
